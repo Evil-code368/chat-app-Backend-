@@ -11,7 +11,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "https://chat-app-frontend-rho-teal.vercel.app", // React frontend
+    origin: "https://www.chatlove.pro", // React frontend
     methods: ["GET", "POST"],
   },
 });
