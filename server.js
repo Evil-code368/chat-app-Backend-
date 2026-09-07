@@ -18,6 +18,57 @@ const io = new Server(server, {
 
 const waitingUsers = [];
 const pairs = new Map();
+const confessions = [];
+const ludoGames = new Map();
+const pendingLudoInvites = new Map();
+
+const LUDO_FINISHED = 58;
+const LUDO_SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
+const otherPlayer = (game, key) => game.players.find((player) => player.key !== key);
+const playerFor = (game, key) => game.players.find((player) => player.key === key);
+const gameFor = (key) => [...ludoGames.values()].find((game) => playerFor(game, key));
+const positionOnTrack = (player, progress) => progress < 0 || progress >= 52
+  ? null
+  : (player.color === "red" ? progress : progress + 26) % 52;
+const canMove = (game, player, tokenIndex) => {
+  const progress = player.tokens[tokenIndex];
+  if (progress === LUDO_FINISHED) return false;
+  if (progress === -1) return game.dice === 6;
+  return progress + game.dice <= LUDO_FINISHED;
+};
+const publicGame = (game) => ({
+  id: game.id,
+  room: game.room,
+  status: game.status,
+  turn: game.turn,
+  dice: game.dice,
+  winner: game.winner,
+  players: game.players.map(({ key, color, name, tokens, connected }) => ({ key, color, name, tokens, connected })),
+});
+const emitGame = (game) => io.to(game.room).emit("ludo:state", publicGame(game));
+const endGame = (game, reason) => {
+  if (!game) return;
+  io.to(game.room).emit("ludo:ended", { reason });
+  ludoGames.delete(game.id);
+};
+const ludoError = (socket, message) => socket.emit("ludo:error", { message });
+const createGame = (first, second) => {
+  const game = {
+    id: `ludo-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    room: "ludo-room-" + Math.random().toString(36).slice(2),
+    status: "playing",
+    turn: first.key,
+    dice: null,
+    winner: null,
+    players: [
+      { ...first, color: "red", tokens: [-1, -1, -1, -1], connected: true },
+      { ...second, color: "green", tokens: [-1, -1, -1, -1], connected: true },
+    ],
+    disconnectTimers: new Map(),
+  };
+  ludoGames.set(game.id, game);
+  return game;
+};
 
 const findOrQueueStranger = (socket, userData) => {
   console.log("Finding stranger for", socket.id, userData);
@@ -57,9 +108,129 @@ const findOrQueueStranger = (socket, userData) => {
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
+  socket.emit("confessions", confessions);
+
+  socket.on("add-confession", (confession) => {
+    if (!confession || !confession.name || !confession.message) return;
+
+    confessions.unshift({
+      ...confession,
+      id: `${Date.now()}-${Math.random()}`,
+      likes: 0,
+      liked: false,
+      comments: [],
+      createdAt: new Date().toISOString(),
+    });
+    confessions.splice(10);
+    io.emit("confessions", confessions);
+  });
+
+  socket.on("like-confession", ({ confessionId, liked }) => {
+    const confession = confessions.find((item) => item.id === confessionId);
+    if (!confession) return;
+    confession.likes = Math.max(0, confession.likes + (liked ? 1 : -1));
+    io.emit("confessions", confessions);
+  });
+
+  socket.on("comment-confession", ({ confessionId, text }) => {
+    const confession = confessions.find((item) => item.id === confessionId);
+    if (!confession || !text) return;
+    confession.comments.push({ id: `${Date.now()}-${Math.random()}`, text });
+    io.emit("confessions", confessions);
+  });
+
   // User wants to find a stranger
   socket.on("find-stranger", (userData) => {
     findOrQueueStranger(socket, userData);
+  });
+
+  socket.on("ludo:resume", ({ playerKey, name } = {}) => {
+    if (typeof playerKey !== "string" || playerKey.length < 8) return;
+    socket.data = { ...(socket.data || {}), playerKey, name: name || socket.data?.name || "Stranger" };
+    const game = gameFor(playerKey);
+    if (!game) return;
+    const player = playerFor(game, playerKey);
+    player.socketId = socket.id;
+    player.connected = true;
+    const timer = game.disconnectTimers.get(playerKey);
+    if (timer) clearTimeout(timer);
+    game.disconnectTimers.delete(playerKey);
+    socket.join(game.room);
+    emitGame(game);
+  });
+
+  socket.on("ludo:invite", () => {
+    const partnerId = pairs.get(socket.id);
+    if (!partnerId) return ludoError(socket, "Connect to a stranger before starting a game.");
+    if (gameFor(socket.data?.playerKey)) return ludoError(socket, "You are already in a Ludo game.");
+    pendingLudoInvites.set(partnerId, { from: socket.id, to: partnerId, name: socket.data?.name || "Stranger" });
+    io.to(partnerId).emit("ludo:invite", { name: socket.data?.name || "Stranger" });
+  });
+
+  socket.on("ludo:respond", ({ accepted } = {}) => {
+    const invite = pendingLudoInvites.get(socket.id);
+    if (!invite) return;
+    pendingLudoInvites.delete(socket.id);
+    if (!accepted) return io.to(invite.from).emit("ludo:declined");
+    const inviter = io.sockets.sockets.get(invite.from);
+    if (!inviter || pairs.get(invite.from) !== socket.id) return ludoError(socket, "The chat connection has ended.");
+    const game = createGame(
+      { key: inviter.data?.playerKey, socketId: inviter.id, name: inviter.data?.name || "Stranger" },
+      { key: socket.data?.playerKey, socketId: socket.id, name: socket.data?.name || "Stranger" },
+    );
+    if (!game.players[0].key || !game.players[1].key) {
+      ludoGames.delete(game.id);
+      return ludoError(socket, "Refresh the chat and try again.");
+    }
+    inviter.join(game.room);
+    socket.join(game.room);
+    emitGame(game);
+  });
+
+  socket.on("ludo:roll", ({ playerKey } = {}) => {
+    const game = gameFor(playerKey);
+    const player = game && playerFor(game, playerKey);
+    if (!game || !player || player.socketId !== socket.id) return ludoError(socket, "Game not found.");
+    if (game.status !== "playing" || game.turn !== playerKey || game.dice !== null) return ludoError(socket, "It is not your turn.");
+    game.dice = Math.floor(Math.random() * 6) + 1;
+    emitGame(game);
+    if (!player.tokens.some((_, tokenIndex) => canMove(game, player, tokenIndex))) {
+      setTimeout(() => {
+        if (game.status !== "playing" || game.dice === null) return;
+        game.dice = null;
+        game.turn = otherPlayer(game, playerKey).key;
+        emitGame(game);
+      }, 900);
+    }
+  });
+
+  socket.on("ludo:move", ({ playerKey, tokenIndex } = {}) => {
+    const game = gameFor(playerKey);
+    const player = game && playerFor(game, playerKey);
+    if (!game || !player || player.socketId !== socket.id) return ludoError(socket, "Game not found.");
+    if (game.status !== "playing" || game.turn !== playerKey || !Number.isInteger(tokenIndex) || tokenIndex < 0 || tokenIndex > 3) return ludoError(socket, "Invalid move.");
+    if (game.dice === null || !canMove(game, player, tokenIndex)) return ludoError(socket, "That token cannot move.");
+    const rolled = game.dice;
+    player.tokens[tokenIndex] = player.tokens[tokenIndex] === -1 ? 0 : player.tokens[tokenIndex] + rolled;
+    const landed = positionOnTrack(player, player.tokens[tokenIndex]);
+    if (landed !== null && !LUDO_SAFE_SQUARES.has(landed)) {
+      const opponent = otherPlayer(game, playerKey);
+      opponent.tokens = opponent.tokens.map((progress) => positionOnTrack(opponent, progress) === landed ? -1 : progress);
+    }
+    if (player.tokens.every((progress) => progress === LUDO_FINISHED)) {
+      game.status = "finished";
+      game.winner = playerKey;
+    } else if (rolled !== 6) {
+      game.turn = otherPlayer(game, playerKey).key;
+    }
+    game.dice = null;
+    emitGame(game);
+  });
+
+  socket.on("ludo:leave", ({ playerKey } = {}) => {
+    const game = gameFor(playerKey);
+    if (!game) return;
+    endGame(game, "Game closed.");
   });
 
   // Send message
@@ -108,6 +279,7 @@ io.on("connection", (socket) => {
 
   // Next stranger
   socket.on("next-stranger", (userData) => {
+    endGame(gameFor(socket.data?.playerKey), "The chat connection changed.");
     const partnerId = pairs.get(socket.id);
 
     if (partnerId) {
@@ -123,6 +295,7 @@ io.on("connection", (socket) => {
 
   // Disconnect user
   socket.on("disconnect-user", () => {
+    endGame(gameFor(socket.data?.playerKey), "The chat connection ended.");
     const partnerId = pairs.get(socket.id);
 
     if (partnerId) {
@@ -138,6 +311,21 @@ io.on("connection", (socket) => {
   // Disconnect
   socket.on("disconnect", () => {
     console.log("Disconnected:", socket.id);
+
+    const game = gameFor(socket.data?.playerKey);
+    if (game) {
+      const player = playerFor(game, socket.data.playerKey);
+      if (player && player.socketId === socket.id) {
+        player.connected = false;
+        const timer = setTimeout(() => {
+          if (player.connected) return;
+          io.to(game.room).emit("ludo:ended", { reason: "The other player disconnected." });
+          ludoGames.delete(game.id);
+        }, 30000);
+        game.disconnectTimers.set(socket.data.playerKey, timer);
+        emitGame(game);
+      }
+    }
 
     const partnerId = pairs.get(socket.id);
 
