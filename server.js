@@ -21,6 +21,8 @@ const pairs = new Map();
 const confessions = [];
 const ludoGames = new Map();
 const pendingLudoInvites = new Map();
+const ticTacToeGames = new Map();
+const pendingTicTacToeInvites = new Map();
 
 const LUDO_FINISHED = 58;
 const LUDO_SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
@@ -50,6 +52,41 @@ const endGame = (game, reason) => {
   if (!game) return;
   io.to(game.room).emit("ludo:ended", { reason });
   ludoGames.delete(game.id);
+};
+const ticTacToeGameFor = (key) => [...ticTacToeGames.values()].find((game) => game.players.some((player) => player.key === key));
+const publicTicTacToeGame = (game) => ({
+  id: game.id,
+  status: game.status,
+  turn: game.turn,
+  winner: game.winner,
+  board: game.board,
+  players: game.players.map(({ key, mark, name, connected }) => ({ key, mark, name, connected })),
+});
+const emitTicTacToeGame = (game) => io.to(game.room).emit("ttt:state", publicTicTacToeGame(game));
+const endTicTacToeGame = (game, reason) => {
+  if (!game) return;
+  io.to(game.room).emit("ttt:ended", { reason });
+  ticTacToeGames.delete(game.id);
+};
+const createTicTacToeGame = (first, second) => {
+  const game = {
+    id: `ttt-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    room: "ttt-room-" + Math.random().toString(36).slice(2),
+    status: "playing",
+    turn: first.key,
+    winner: null,
+    board: Array(9).fill(null),
+    players: [
+      { ...first, mark: "X", connected: true },
+      { ...second, mark: "O", connected: true },
+    ],
+  };
+  ticTacToeGames.set(game.id, game);
+  return game;
+};
+const ticTacToeWinner = (board) => {
+  const lines = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]];
+  return lines.find(([a, b, c]) => board[a] && board[a] === board[b] && board[a] === board[c]);
 };
 const ludoError = (socket, message) => socket.emit("ludo:error", { message });
 const createGame = (first, second) => {
@@ -157,6 +194,68 @@ io.on("connection", (socket) => {
     game.disconnectTimers.delete(playerKey);
     socket.join(game.room);
     emitGame(game);
+  });
+
+  socket.on("ttt:resume", ({ playerKey, name } = {}) => {
+    if (typeof playerKey !== "string" || playerKey.length < 8) return;
+    socket.data = { ...(socket.data || {}), playerKey, name: name || socket.data?.name || "Stranger" };
+    const game = ticTacToeGameFor(playerKey);
+    if (!game) return;
+    const player = game.players.find((item) => item.key === playerKey);
+    player.socketId = socket.id;
+    player.connected = true;
+    socket.join(game.room);
+    emitTicTacToeGame(game);
+  });
+
+  socket.on("ttt:invite", () => {
+    const partnerId = pairs.get(socket.id);
+    if (!partnerId) return socket.emit("ttt:error", { message: "Connect to a stranger before starting a game." });
+    if (ticTacToeGameFor(socket.data?.playerKey)) return socket.emit("ttt:error", { message: "You are already in a Tic-Tac-Toe game." });
+    pendingTicTacToeInvites.set(partnerId, { from: socket.id, name: socket.data?.name || "Stranger" });
+    io.to(partnerId).emit("ttt:invite", { name: socket.data?.name || "Stranger" });
+  });
+
+  socket.on("ttt:respond", ({ accepted } = {}) => {
+    const invite = pendingTicTacToeInvites.get(socket.id);
+    if (!invite) return;
+    pendingTicTacToeInvites.delete(socket.id);
+    if (!accepted) return io.to(invite.from).emit("ttt:declined");
+    const inviter = io.sockets.sockets.get(invite.from);
+    if (!inviter || pairs.get(invite.from) !== socket.id) return socket.emit("ttt:error", { message: "The chat connection has ended." });
+    const game = createTicTacToeGame(
+      { key: inviter.data?.playerKey, socketId: inviter.id, name: inviter.data?.name || "Stranger" },
+      { key: socket.data?.playerKey, socketId: socket.id, name: socket.data?.name || "Stranger" },
+    );
+    if (!game.players[0].key || !game.players[1].key) {
+      ticTacToeGames.delete(game.id);
+      return socket.emit("ttt:error", { message: "Refresh the chat and try again." });
+    }
+    inviter.join(game.room);
+    socket.join(game.room);
+    emitTicTacToeGame(game);
+  });
+
+  socket.on("ttt:move", ({ playerKey, index } = {}) => {
+    const game = ticTacToeGameFor(playerKey);
+    const player = game?.players.find((item) => item.key === playerKey);
+    if (!game || !player || player.socketId !== socket.id) return socket.emit("ttt:error", { message: "Game not found." });
+    if (game.status !== "playing" || game.turn !== playerKey || !Number.isInteger(index) || index < 0 || index > 8 || game.board[index]) return socket.emit("ttt:error", { message: "That square is not available." });
+    game.board[index] = player.mark;
+    const winningLine = ticTacToeWinner(game.board);
+    if (winningLine) {
+      game.status = "finished";
+      game.winner = playerKey;
+    } else if (game.board.every(Boolean)) {
+      game.status = "draw";
+    } else {
+      game.turn = game.players.find((item) => item.key !== playerKey).key;
+    }
+    emitTicTacToeGame(game);
+  });
+
+  socket.on("ttt:leave", ({ playerKey } = {}) => {
+    endTicTacToeGame(ticTacToeGameFor(playerKey), "Game closed.");
   });
 
   socket.on("ludo:invite", () => {
@@ -280,6 +379,7 @@ io.on("connection", (socket) => {
   // Next stranger
   socket.on("next-stranger", (userData) => {
     endGame(gameFor(socket.data?.playerKey), "The chat connection changed.");
+    endTicTacToeGame(ticTacToeGameFor(socket.data?.playerKey), "The chat connection changed.");
     const partnerId = pairs.get(socket.id);
 
     if (partnerId) {
@@ -296,6 +396,7 @@ io.on("connection", (socket) => {
   // Disconnect user
   socket.on("disconnect-user", () => {
     endGame(gameFor(socket.data?.playerKey), "The chat connection ended.");
+    endTicTacToeGame(ticTacToeGameFor(socket.data?.playerKey), "The chat connection ended.");
     const partnerId = pairs.get(socket.id);
 
     if (partnerId) {
