@@ -80,6 +80,7 @@ const createTicTacToeGame = (first, second) => {
       { ...first, mark: "X", connected: true },
       { ...second, mark: "O", connected: true },
     ],
+    disconnectTimers: new Map(),
   };
   ticTacToeGames.set(game.id, game);
   return game;
@@ -204,6 +205,9 @@ io.on("connection", (socket) => {
     const player = game.players.find((item) => item.key === playerKey);
     player.socketId = socket.id;
     player.connected = true;
+    const timer = game.disconnectTimers.get(playerKey);
+    if (timer) clearTimeout(timer);
+    game.disconnectTimers.delete(playerKey);
     socket.join(game.room);
     emitTicTacToeGame(game);
   });
@@ -425,6 +429,20 @@ io.on("connection", (socket) => {
         }, 30000);
         game.disconnectTimers.set(socket.data.playerKey, timer);
         emitGame(game);
+      }
+    }
+
+    const ticTacToeGame = ticTacToeGameFor(socket.data?.playerKey);
+    if (ticTacToeGame) {
+      const player = ticTacToeGame.players.find((item) => item.key === socket.data.playerKey);
+      if (player && player.socketId === socket.id) {
+        player.connected = false;
+        const timer = setTimeout(() => {
+          if (player.connected) return;
+          endTicTacToeGame(ticTacToeGame, "The other player disconnected.");
+        }, 30000);
+        ticTacToeGame.disconnectTimers.set(socket.data.playerKey, timer);
+        emitTicTacToeGame(ticTacToeGame);
       }
     }
 
