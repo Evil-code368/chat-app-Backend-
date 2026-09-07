@@ -262,6 +262,18 @@ io.on("connection", (socket) => {
     endTicTacToeGame(ticTacToeGameFor(playerKey), "Game closed.");
   });
 
+  socket.on("ttt:replay", ({ playerKey } = {}) => {
+    const game = ticTacToeGameFor(playerKey);
+    const player = game?.players.find((item) => item.key === playerKey);
+    if (!game || !player || player.socketId !== socket.id) return socket.emit("ttt:error", { message: "Game not found." });
+    if (game.status === "playing") return socket.emit("ttt:error", { message: "The current game is still in progress." });
+    game.status = "playing";
+    game.turn = game.players[0].key;
+    game.winner = null;
+    game.board = Array(9).fill(null);
+    emitTicTacToeGame(game);
+  });
+
   socket.on("ludo:invite", () => {
     const partnerId = pairs.get(socket.id);
     if (!partnerId) return ludoError(socket, "Connect to a stranger before starting a game.");
@@ -334,6 +346,19 @@ io.on("connection", (socket) => {
     const game = gameFor(playerKey);
     if (!game) return;
     endGame(game, "Game closed.");
+  });
+
+  socket.on("ludo:replay", ({ playerKey } = {}) => {
+    const game = gameFor(playerKey);
+    const player = game && playerFor(game, playerKey);
+    if (!game || !player || player.socketId !== socket.id) return ludoError(socket, "Game not found.");
+    if (game.status === "playing") return ludoError(socket, "The current game is still in progress.");
+    game.status = "playing";
+    game.turn = game.players[0].key;
+    game.dice = null;
+    game.winner = null;
+    game.players.forEach((gamePlayer) => { gamePlayer.tokens = [-1, -1, -1, -1]; });
+    emitGame(game);
   });
 
   // Send message
